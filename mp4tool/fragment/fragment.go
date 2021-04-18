@@ -83,6 +83,7 @@ type track struct {
 
 type mp4fragment struct {
 	trackMap        map[uint32]*track
+	trackIDs        []uint32
 	videoTrackID    uint32
 	videoTrackCount int
 	r               io.ReadSeeker
@@ -119,7 +120,6 @@ func (m *mp4fragment) fragment() error {
 }
 
 func (m *mp4fragment) buildInit() error {
-	var track int
 	_, err := mp4.ReadBoxStructure(m.r, func(h *mp4.ReadHandle) (interface{}, error) {
 		switch h.BoxInfo.Type {
 		case mp4.BoxTypeFtyp():
@@ -172,11 +172,6 @@ func (m *mp4fragment) buildInit() error {
 			return nil, err
 
 		case mp4.BoxTypeTrak():
-			// FIXME
-			if track == 1 {
-				return nil, nil
-			}
-			track++
 			return nil, m.buildTrak(&h.BoxInfo)
 
 		default:
@@ -322,6 +317,7 @@ func (m *mp4fragment) buildTrak(trak *mp4.BoxInfo) error {
 		return errors.New("tkhd not found")
 	}
 	tkhd := ibox.(*mp4.Tkhd)
+	m.trackIDs = append(m.trackIDs, tkhd.TrackID)
 
 	ibox, ok = iboxes[mp4.BoxTypeMdhd()]
 	if !ok {
@@ -509,178 +505,198 @@ func (m *mp4fragment) markKeyframes() error {
 }
 
 func (m *mp4fragment) buildFragments() error {
-	trackID := m.videoTrackID
-	track := m.trackMap[trackID]
-
 	type moofInfo struct {
 		time   int64
 		offset uint64
 	}
-	moofs := make([]moofInfo, 0)
+
+	type trackFragmentStat struct {
+		moofs       []moofInfo
+		sampleBegin int
+		sampleEnd   int
+	}
+
+	fmap := make(map[uint32]*trackFragmentStat)
+	for _, trackID := range m.trackIDs {
+		fmap[trackID] = &trackFragmentStat{
+			moofs: make([]moofInfo, 0),
+		}
+	}
 
 	sequenceNumber := uint32(1)
-	var sampleBegin int
-	var sampleEnd int
-	for sampleEnd < len(track.samples) {
-		sampleBegin = sampleEnd
-		var segmentDuration uint32
-		for {
-			segmentDuration += track.samples[sampleEnd].duration
-			sampleEnd++
-			if sampleEnd == len(track.samples) {
-				break
+	for {
+		var next bool
+		for _, trackID := range m.trackIDs {
+			track := m.trackMap[trackID]
+			f := fmap[trackID]
+			if f.sampleEnd >= len(track.samples) {
+				continue
 			}
-			if track.samples[sampleEnd].keyframe &&
-				float64(segmentDuration)/float64(track.timescale) >= minSegmentDuration {
-				break
+			next = true
+
+			f.sampleBegin = f.sampleEnd
+			var segmentDuration uint32
+			for {
+				segmentDuration += track.samples[f.sampleEnd].duration
+				f.sampleEnd++
+				if f.sampleEnd == len(track.samples) {
+					break
+				}
+				if track.samples[f.sampleEnd].keyframe &&
+					float64(segmentDuration)/float64(track.timescale) >= minSegmentDuration {
+					break
+				}
 			}
-		}
-		samples := track.samples[sampleBegin:sampleEnd]
-		constDuration := true
-		for i := 1; i < len(samples); i++ {
-			if samples[0].duration != samples[i].duration {
-				constDuration = false
-				break
+			samples := track.samples[f.sampleBegin:f.sampleEnd]
+			constDuration := true
+			for i := 1; i < len(samples); i++ {
+				if samples[0].duration != samples[i].duration {
+					constDuration = false
+					break
+				}
 			}
-		}
 
-		// start moof
-		bi, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeMoof()})
-		if err != nil {
-			return err
-		}
-		moofs = append(moofs, moofInfo{
-			time:   samples[0].baseTime,
-			offset: bi.Offset,
-		})
-		if _, err := mp4.Marshal(m.w, &mp4.Moof{}, mp4.Context{}); err != nil {
-			return err
-		}
-
-		// mfhd
-		if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeMfhd()}); err != nil {
-			return err
-		}
-		if _, err := mp4.Marshal(m.w, &mp4.Mfhd{
-			SequenceNumber: sequenceNumber,
-		}, mp4.Context{}); err != nil {
-			return err
-		}
-		if _, err := m.w.EndBox(); err != nil {
-			return err
-		}
-		sequenceNumber++
-
-		// start traf
-		if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTraf()}); err != nil {
-			return err
-		}
-
-		// tfhd
-		if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTfhd()}); err != nil {
-			return err
-		}
-		tfhd := &mp4.Tfhd{
-			FullBox:                mp4.FullBox{Flags: [3]byte{0x02, 0x00, 0x22}},
-			TrackID:                trackID,
-			SampleDescriptionIndex: samples[0].descIndex,
-			DefaultSampleFlags:     0x01010000, // sample_depends_on=1 sample_is_non_sync_sample=1
-		}
-		if constDuration {
-			tfhd.AddFlag(0x000008)
-			tfhd.DefaultSampleDuration = samples[0].duration
-		}
-		if _, err := mp4.Marshal(m.w, tfhd, mp4.Context{}); err != nil {
-			return err
-		}
-		if _, err := m.w.EndBox(); err != nil {
-			return err
-		}
-
-		// tfdt
-		if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTfdt()}); err != nil {
-			return err
-		}
-		if _, err := mp4.Marshal(m.w, &mp4.Tfdt{
-			FullBox:               mp4.FullBox{Version: 1},
-			BaseMediaDecodeTimeV1: uint64(samples[0].baseTime),
-		}, mp4.Context{}); err != nil {
-			return err
-		}
-		if _, err := m.w.EndBox(); err != nil {
-			return err
-		}
-
-		// trun
-		if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTrun()}); err != nil {
-			return err
-		}
-		trun := &mp4.Trun{
-			FullBox:          mp4.FullBox{Flags: [3]byte{0x00, 0x0a, 0x05}},
-			SampleCount:      uint32(len(samples)),
-			FirstSampleFlags: 0x02000000, // sample_depends_on=2
-			Entries:          make([]mp4.TrunEntry, 0, len(samples)),
-		}
-		if !constDuration {
-			trun.AddFlag(0x000100)
-		}
-		for _, sample := range samples {
-			trunEntry := mp4.TrunEntry{
-				SampleDuration:                sample.duration,
-				SampleSize:                    sample.dataSize,
-				SampleCompositionTimeOffsetV0: uint32(sample.timeOffset),
-				SampleCompositionTimeOffsetV1: int32(sample.timeOffset),
-			}
-			if sample.timeOffset < 0 {
-				trun.Version = 1
-			}
-			trun.Entries = append(trun.Entries, trunEntry)
-		}
-		if _, err := mp4.Marshal(m.w, trun, mp4.Context{}); err != nil {
-			return err
-		}
-		trunInfo, err := m.w.EndBox()
-		if err != nil {
-			return err
-		}
-
-		// end traf
-		if _, err := m.w.EndBox(); err != nil {
-			return err
-		}
-
-		// end moof
-		moofInfo, err := m.w.EndBox()
-		if err != nil {
-			return err
-		}
-
-		// update trun data-offset
-		trun.DataOffset = int32(moofInfo.Size + 8)
-		if _, err := trunInfo.SeekToPayload(m.w); err != nil {
-			return err
-		}
-		if _, err := mp4.Marshal(m.w, trun, mp4.Context{}); err != nil {
-			return err
-		}
-		if _, err := m.w.Seek(0, io.SeekEnd); err != nil {
-			return err
-		}
-
-		// mdat
-		if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeMdat()}); err != nil {
-			return err
-		}
-		for _, sample := range samples {
-			if _, err := m.r.Seek(int64(sample.dataOffset), io.SeekStart); err != nil {
+			// start moof
+			bi, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeMoof()})
+			if err != nil {
 				return err
 			}
-			if _, err := io.CopyN(m.w, m.r, int64(sample.dataSize)); err != nil {
+			f.moofs = append(f.moofs, moofInfo{
+				time:   samples[0].baseTime,
+				offset: bi.Offset,
+			})
+			if _, err := mp4.Marshal(m.w, &mp4.Moof{}, mp4.Context{}); err != nil {
+				return err
+			}
+
+			// mfhd
+			if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeMfhd()}); err != nil {
+				return err
+			}
+			if _, err := mp4.Marshal(m.w, &mp4.Mfhd{
+				SequenceNumber: sequenceNumber,
+			}, mp4.Context{}); err != nil {
+				return err
+			}
+			if _, err := m.w.EndBox(); err != nil {
+				return err
+			}
+			sequenceNumber++
+
+			// start traf
+			if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTraf()}); err != nil {
+				return err
+			}
+
+			// tfhd
+			if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTfhd()}); err != nil {
+				return err
+			}
+			tfhd := &mp4.Tfhd{
+				FullBox:                mp4.FullBox{Flags: [3]byte{0x02, 0x00, 0x22}},
+				TrackID:                trackID,
+				SampleDescriptionIndex: samples[0].descIndex,
+				DefaultSampleFlags:     0x01010000, // sample_depends_on=1 sample_is_non_sync_sample=1
+			}
+			if constDuration {
+				tfhd.AddFlag(0x000008)
+				tfhd.DefaultSampleDuration = samples[0].duration
+			}
+			if _, err := mp4.Marshal(m.w, tfhd, mp4.Context{}); err != nil {
+				return err
+			}
+			if _, err := m.w.EndBox(); err != nil {
+				return err
+			}
+
+			// tfdt
+			if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTfdt()}); err != nil {
+				return err
+			}
+			if _, err := mp4.Marshal(m.w, &mp4.Tfdt{
+				FullBox:               mp4.FullBox{Version: 1},
+				BaseMediaDecodeTimeV1: uint64(samples[0].baseTime),
+			}, mp4.Context{}); err != nil {
+				return err
+			}
+			if _, err := m.w.EndBox(); err != nil {
+				return err
+			}
+
+			// trun
+			if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTrun()}); err != nil {
+				return err
+			}
+			trun := &mp4.Trun{
+				FullBox:          mp4.FullBox{Flags: [3]byte{0x00, 0x0a, 0x05}},
+				SampleCount:      uint32(len(samples)),
+				FirstSampleFlags: 0x02000000, // sample_depends_on=2
+				Entries:          make([]mp4.TrunEntry, 0, len(samples)),
+			}
+			if !constDuration {
+				trun.AddFlag(0x000100)
+			}
+			for _, sample := range samples {
+				trunEntry := mp4.TrunEntry{
+					SampleDuration:                sample.duration,
+					SampleSize:                    sample.dataSize,
+					SampleCompositionTimeOffsetV0: uint32(sample.timeOffset),
+					SampleCompositionTimeOffsetV1: int32(sample.timeOffset),
+				}
+				if sample.timeOffset < 0 {
+					trun.Version = 1
+				}
+				trun.Entries = append(trun.Entries, trunEntry)
+			}
+			if _, err := mp4.Marshal(m.w, trun, mp4.Context{}); err != nil {
+				return err
+			}
+			trunInfo, err := m.w.EndBox()
+			if err != nil {
+				return err
+			}
+
+			// end traf
+			if _, err := m.w.EndBox(); err != nil {
+				return err
+			}
+
+			// end moof
+			moofInfo, err := m.w.EndBox()
+			if err != nil {
+				return err
+			}
+
+			// update trun data-offset
+			trun.DataOffset = int32(moofInfo.Size + 8)
+			if _, err := trunInfo.SeekToPayload(m.w); err != nil {
+				return err
+			}
+			if _, err := mp4.Marshal(m.w, trun, mp4.Context{}); err != nil {
+				return err
+			}
+			if _, err := m.w.Seek(0, io.SeekEnd); err != nil {
+				return err
+			}
+
+			// mdat
+			if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeMdat()}); err != nil {
+				return err
+			}
+			for _, sample := range samples {
+				if _, err := m.r.Seek(int64(sample.dataOffset), io.SeekStart); err != nil {
+					return err
+				}
+				if _, err := io.CopyN(m.w, m.r, int64(sample.dataSize)); err != nil {
+					return err
+				}
+			}
+			if _, err := m.w.EndBox(); err != nil {
 				return err
 			}
 		}
-		if _, err := m.w.EndBox(); err != nil {
-			return err
+		if !next {
+			break
 		}
 	}
 
@@ -689,32 +705,36 @@ func (m *mp4fragment) buildFragments() error {
 		return err
 	}
 
-	// tfra
-	if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTfra()}); err != nil {
-		return err
-	}
-	tfra := &mp4.Tfra{
-		TrackID:               trackID,
-		LengthSizeOfTrafNum:   0x00,
-		LengthSizeOfTrunNum:   0x00,
-		LengthSizeOfSampleNum: 0x00,
-		NumberOfEntry:         4,
-		Entries:               make([]mp4.TfraEntry, 0, len(moofs)),
-	}
-	for _, moofInfo := range moofs {
-		tfra.Entries = append(tfra.Entries, mp4.TfraEntry{
-			TimeV0:       uint32(moofInfo.time),
-			MoofOffsetV0: uint32(moofInfo.offset),
-			TrafNumber:   1,
-			TrunNumber:   1,
-			SampleNumber: 1,
-		})
-	}
-	if _, err := mp4.Marshal(m.w, tfra, mp4.Context{}); err != nil {
-		return err
-	}
-	if _, err := m.w.EndBox(); err != nil {
-		return err
+	for _, trackID := range m.trackIDs {
+		f := fmap[trackID]
+
+		// tfra
+		if _, err := m.w.StartBox(&mp4.BoxInfo{Type: mp4.BoxTypeTfra()}); err != nil {
+			return err
+		}
+		tfra := &mp4.Tfra{
+			TrackID:               trackID,
+			LengthSizeOfTrafNum:   0x00,
+			LengthSizeOfTrunNum:   0x00,
+			LengthSizeOfSampleNum: 0x00,
+			NumberOfEntry:         4,
+			Entries:               make([]mp4.TfraEntry, 0, len(f.moofs)),
+		}
+		for _, moofInfo := range f.moofs {
+			tfra.Entries = append(tfra.Entries, mp4.TfraEntry{
+				TimeV0:       uint32(moofInfo.time),
+				MoofOffsetV0: uint32(moofInfo.offset),
+				TrafNumber:   1,
+				TrunNumber:   1,
+				SampleNumber: 1,
+			})
+		}
+		if _, err := mp4.Marshal(m.w, tfra, mp4.Context{}); err != nil {
+			return err
+		}
+		if _, err := m.w.EndBox(); err != nil {
+			return err
+		}
 	}
 
 	// mfro
